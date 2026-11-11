@@ -3,13 +3,8 @@ package com.soft.koyar.data.bluetooth
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager as SystemBluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.BluetoothStatusCodes
+import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -28,25 +23,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.IOException
+import java.io.InputStreamReader
+import java.io.OutputStream
 import java.util.Locale
 import java.util.UUID
 
 /**
- * Manages Bluetooth Low Energy (BLE GATT) connection to the ESP32 Bike Controller.
- * Handles continuous line-delimited notifications (RX) and sending commands with newline delimiter (TX).
+ * Manages Bluetooth Serial Port Profile (SPP / RFCOMM) connection to the ESP32 Bike Controller.
+ * Handles continuous line-delimited serial packet parsing (RX) and sending commands with newline delimiter (TX).
  */
 class BluetoothManager(private val context: Context) {
 
     companion object {
         private const val TAG = "BluetoothManager"
-
-        // BLE Custom Service and Characteristic UUIDs defined on the ESP32
-        val SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
-        val CHARACTERISTIC_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26ae")
-
-        // Standard Client Characteristic Configuration Descriptor (CCCD) for enabling NOTIFY / INDICATE
-        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-
+        // Standard SPP (Serial Port Profile) UUID
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val MAX_LOG_ENTRIES = 500
 
         /**
@@ -81,12 +74,10 @@ class BluetoothManager(private val context: Context) {
     val logMessages: StateFlow<List<LogMessage>> = _logMessages.asStateFlow()
     val logs: StateFlow<List<LogMessage>> = _logMessages.asStateFlow()
 
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var targetCharacteristic: BluetoothGattCharacteristic? = null
+    private var socket: BluetoothSocket? = null
+    private var outputStream: OutputStream? = null
     private var connectionScope = CoroutineScope(Dispatchers.IO + Job())
-
-    // Buffer to reconstruct newline-delimited packets across BLE chunks
-    private val rxBuffer = StringBuilder()
+    private var readJob: Job? = null
 
     /**
      * Checks if runtime Bluetooth permissions are granted depending on Android SDK version.
@@ -134,7 +125,7 @@ class BluetoothManager(private val context: Context) {
     }
 
     /**
-     * Connects to the ESP32 via Bluetooth Low Energy (GATT).
+     * Asynchronously connects to the target ESP32 Bluetooth device by MAC Address.
      */
     suspend fun connect(macAddress: String) = withContext(Dispatchers.IO) {
         val cleanedMac = normalizeMacAddress(macAddress)
@@ -162,170 +153,235 @@ class BluetoothManager(private val context: Context) {
 
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
-            val errorMsg = "Bluetooth non disponible ou désactivé sur le smartphone"
+            val errorMsg = "Bluetooth non disponible ou désactivé sur l'appareil"
             _connectionState.value = ConnectionState.Error(errorMsg)
             addLog(errorMsg, isIncoming = false)
             return@withContext
         }
 
-        // Close any previous GATT connection
+        // Close existing connection first
         disconnectInternal()
 
         _connectionState.value = ConnectionState.Connecting
-        addLog("Connexion BLE (GATT) vers $cleanedMac...", isIncoming = false)
+        addLog("Connexion vers $cleanedMac...", isIncoming = false)
 
         try {
-            val device = adapter.getRemoteDevice(cleanedMac)
-            val devName = try { device.name ?: "ESP32-Bike" } catch (e: SecurityException) { "ESP32-Bike" }
+            // Cancel discovery before connecting
+            addLog("Annulation du scan/discovery avant la connexion...", isIncoming = false)
+            try {
+                adapter.cancelDiscovery()
+            } catch (e: SecurityException) {
+                addLog("Warning: permissions scan limitées pour cancelDiscovery: ${e.message}", isIncoming = false)
+            } catch (e: Exception) {
+                addLog("Warning: cancelDiscovery failed: ${e.message}", isIncoming = false)
+            }
 
-            addLog("Ouverture connexion GATT (TRANSPORT_LE)...", isIncoming = false)
+            // Check bonded / paired devices case-insensitively
+            addLog("Recherche de $cleanedMac dans les appareils appairés (bondedDevices)...", isIncoming = false)
+            val bondedDevices: Set<BluetoothDevice>? = try {
+                adapter.bondedDevices
+            } catch (e: SecurityException) {
+                addLog("Warning: accès aux appareils appairés limité: ${e.message}", isIncoming = false)
+                null
+            }
 
-            // Connect using TRANSPORT_LE to force Bluetooth Low Energy on modern Android
-            bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            val bondedDevice = bondedDevices?.find { it.address.equals(cleanedMac, ignoreCase = true) }
+            val targetDevice: BluetoothDevice = if (bondedDevice != null) {
+                val devName = try { bondedDevice.name ?: "ESP32" } catch (e: SecurityException) { "ESP32" }
+                addLog("Appareil appairé trouvé: $devName ($cleanedMac). Utilisation directe de l'instance d'appareil appairé.", isIncoming = false)
+                bondedDevice
             } else {
-                device.connectGatt(context, false, gattCallback)
+                addLog("Appareil $cleanedMac non trouvé dans la liste d'appairage. Récupération via getRemoteDevice...", isIncoming = false)
+                adapter.getRemoteDevice(cleanedMac)
             }
 
-            if (bluetoothGatt == null) {
-                val errorMsg = "Échec d'initialisation de connectGatt()"
-                _connectionState.value = ConnectionState.Error(errorMsg)
-                addLog(errorMsg, isIncoming = false)
+            var currentSocket: BluetoothSocket? = null
+            var isConnected = false
+
+            // Multi-level Connection Sequence
+            // Stage A: Attempt targetDevice.createRfcommSocketToServiceRecord(SPP_UUID) (Standard SPP UUID)
+            if (!isConnected) {
+                val stage = "Stage A (Standard SPP UUID 00001101-0000-1000-8000-00805F9B34FB)"
+                addLog("Tentative $stage...", isIncoming = false)
+                try {
+                    val s = targetDevice.createRfcommSocketToServiceRecord(SPP_UUID)
+                    currentSocket = s
+                    s.connect()
+                    isConnected = true
+                    addLog("Connexion réussie via $stage!", isIncoming = false)
+                } catch (e: Throwable) {
+                    val msg = e.message ?: e.toString()
+                    addLog("Échec $stage: $msg", isIncoming = false)
+                    try { currentSocket?.close() } catch (_: Exception) {}
+                    currentSocket = null
+                }
             }
+
+            // Stage B: Attempt targetDevice.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            if (!isConnected) {
+                val stage = "Stage B (Insecure SPP UUID)"
+                addLog("Tentative $stage...", isIncoming = false)
+                try {
+                    val s = targetDevice.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+                    currentSocket = s
+                    s.connect()
+                    isConnected = true
+                    addLog("Connexion réussie via $stage!", isIncoming = false)
+                } catch (e: Throwable) {
+                    val msg = e.message ?: e.toString()
+                    addLog("Échec $stage: $msg", isIncoming = false)
+                    try { currentSocket?.close() } catch (_: Exception) {}
+                    currentSocket = null
+                }
+            }
+
+            // Stage C: Attempt reflection channel 1 createRfcommSocketToServiceRecord / createRfcommSocket
+            if (!isConnected) {
+                val stage = "Stage C (Reflection Channel 1)"
+                addLog("Tentative $stage...", isIncoming = false)
+                try {
+                    val s = createReflectionSocket(targetDevice, channel = 1, insecure = false)
+                    currentSocket = s
+                    s.connect()
+                    isConnected = true
+                    addLog("Connexion réussie via $stage!", isIncoming = false)
+                } catch (e: Throwable) {
+                    val msg = e.message ?: e.toString()
+                    addLog("Échec $stage: $msg", isIncoming = false)
+                    try { currentSocket?.close() } catch (_: Exception) {}
+                    currentSocket = null
+                }
+            }
+
+            // Stage D: Attempt channel 2 or reflection insecure
+            if (!isConnected) {
+                val stage = "Stage D1 (Reflection Channel 2)"
+                addLog("Tentative $stage...", isIncoming = false)
+                try {
+                    val s = createReflectionSocket(targetDevice, channel = 2, insecure = false)
+                    currentSocket = s
+                    s.connect()
+                    isConnected = true
+                    addLog("Connexion réussie via $stage!", isIncoming = false)
+                } catch (e: Throwable) {
+                    val msg = e.message ?: e.toString()
+                    addLog("Échec $stage: $msg", isIncoming = false)
+                    try { currentSocket?.close() } catch (_: Exception) {}
+                    currentSocket = null
+                }
+            }
+
+            if (!isConnected) {
+                val stage = "Stage D2 (Reflection Insecure Channel 1)"
+                addLog("Tentative $stage...", isIncoming = false)
+                try {
+                    val s = createReflectionSocket(targetDevice, channel = 1, insecure = true)
+                    currentSocket = s
+                    s.connect()
+                    isConnected = true
+                    addLog("Connexion réussie via $stage!", isIncoming = false)
+                } catch (e: Throwable) {
+                    val msg = e.message ?: e.toString()
+                    addLog("Échec $stage: $msg", isIncoming = false)
+                    try { currentSocket?.close() } catch (_: Exception) {}
+                    currentSocket = null
+                }
+            }
+
+            val activeSocket = currentSocket
+                ?: throw IOException("Toutes les étapes de connexion (Stage A-D) ont échoué vers $cleanedMac")
+
+            socket = activeSocket
+            outputStream = activeSocket.outputStream
+
+            val deviceName = try {
+                targetDevice.name ?: "ESP32-Bike"
+            } catch (e: SecurityException) {
+                "ESP32-Bike"
+            }
+
+            _connectionState.value = ConnectionState.Connected(deviceName, cleanedMac)
+            addLog("Socket connecté avec succès à $deviceName ($cleanedMac)", isIncoming = false)
+
+            startListening(activeSocket)
+
         } catch (e: SecurityException) {
-            val errorMsg = "Permission Bluetooth refusée: ${e.localizedMessage}"
+            val errorMsg = "Permission Bluetooth manquante: ${e.localizedMessage}"
+            Log.e(TAG, errorMsg, e)
             _connectionState.value = ConnectionState.Error(errorMsg)
             addLog(errorMsg, isIncoming = false)
+            disconnectInternal()
+        } catch (e: IOException) {
+            val errorMsg = "Erreur de connexion Bluetooth (I/O): ${e.localizedMessage}"
+            Log.e(TAG, errorMsg, e)
+            _connectionState.value = ConnectionState.Error(errorMsg)
+            addLog(errorMsg, isIncoming = false)
+            disconnectInternal()
+        } catch (e: IllegalArgumentException) {
+            val errorMsg = "Argument Bluetooth invalide: ${e.localizedMessage}"
+            Log.e(TAG, errorMsg, e)
+            _connectionState.value = ConnectionState.Error(errorMsg)
+            addLog(errorMsg, isIncoming = false)
+            disconnectInternal()
         } catch (e: Exception) {
-            val errorMsg = "Erreur connexion BLE: ${e.localizedMessage}"
+            val errorMsg = "Erreur inattendue de connexion: ${e.localizedMessage}"
+            Log.e(TAG, errorMsg, e)
             _connectionState.value = ConnectionState.Error(errorMsg)
             addLog(errorMsg, isIncoming = false)
+            disconnectInternal()
         }
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            val devAddress = gatt.device.address
-            val devName = try { gatt.device.name ?: "ESP32-Bike" } catch (e: SecurityException) { "ESP32-Bike" }
-
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                addLog("Connecté au serveur BLE GATT ($devAddress). Découverte des services...", isIncoming = false)
-                try {
-                    // Discover GATT services on the ESP32
-                    gatt.discoverServices()
-                } catch (e: SecurityException) {
-                    addLog("Erreur discoverServices (permission): ${e.message}", isIncoming = false)
-                }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                addLog("Déconnecté du périphérique BLE (status=$status)", isIncoming = false)
-                targetCharacteristic = null
-                _connectionState.value = ConnectionState.Disconnected
-            }
+    private fun createReflectionSocket(device: BluetoothDevice, channel: Int, insecure: Boolean): BluetoothSocket {
+        val methodName = if (insecure) "createInsecureRfcommSocket" else "createRfcommSocket"
+        return try {
+            val method = device.javaClass.getMethod("createRfcommSocketToServiceRecord", Int::class.javaPrimitiveType)
+            method.invoke(device, channel) as BluetoothSocket
+        } catch (e: NoSuchMethodException) {
+            val method = device.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
+            method.invoke(device, channel) as BluetoothSocket
         }
+    }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                addLog("Services BLE découverts avec succès.", isIncoming = false)
-                val service = gatt.getService(SERVICE_UUID)
-                if (service == null) {
-                    val errorMsg = "Service BLE introuvable: $SERVICE_UUID"
-                    addLog(errorMsg, isIncoming = false)
-                    _connectionState.value = ConnectionState.Error(errorMsg)
-                    return
-                }
-
-                val characteristic = service.getCharacteristic(CHARACTERISTIC_UUID)
-                if (characteristic == null) {
-                    val errorMsg = "Caractéristique BLE introuvable: $CHARACTERISTIC_UUID"
-                    addLog(errorMsg, isIncoming = false)
-                    _connectionState.value = ConnectionState.Error(errorMsg)
-                    return
-                }
-
-                targetCharacteristic = characteristic
-
-                // Enable local notifications
-                try {
-                    val notifySet = gatt.setCharacteristicNotification(characteristic, true)
-                    addLog("Notification locale activée: $notifySet", isIncoming = false)
-
-                    // Write CCCD descriptor to enable ESP32 notifications/indications
-                    val descriptor = characteristic.getDescriptor(CCCD_UUID)
-                    if (descriptor != null) {
-                        val descriptorValue = if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        } else {
-                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                        }
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            gatt.writeDescriptor(descriptor, descriptorValue)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            descriptor.value = descriptorValue
-                            @Suppress("DEPRECATION")
-                            gatt.writeDescriptor(descriptor)
-                        }
-                        addLog("Souscription CCCD envoyée à l'ESP32.", isIncoming = false)
+    /**
+     * Continuous loop reading line-delimited serial text packets from the Bluetooth input stream.
+     */
+    private fun startListening(activeSocket: BluetoothSocket) {
+        readJob?.cancel()
+        readJob = connectionScope.launch(Dispatchers.IO) {
+            try {
+                val reader = BufferedReader(InputStreamReader(activeSocket.inputStream, Charsets.UTF_8))
+                while (activeSocket.isConnected) {
+                    val line = reader.readLine() ?: break
+                    if (line.isNotBlank()) {
+                        processIncomingPacket(line.trim())
                     }
-
-                    // Request higher MTU (up to 512) for large packets
-                    gatt.requestMtu(512)
-
-                } catch (e: SecurityException) {
-                    addLog("Erreur activation notifications (permission): ${e.message}", isIncoming = false)
                 }
-
-                val devName = try { gatt.device.name ?: "ESP32-Bike" } catch (e: SecurityException) { "ESP32-Bike" }
-                _connectionState.value = ConnectionState.Connected(devName, gatt.device.address)
-                addLog("Prêt ! Connexion active avec l'ESP32.", isIncoming = false)
-
-            } else {
-                val errorMsg = "Échec de la découverte des services GATT (status=$status)"
-                addLog(errorMsg, isIncoming = false)
-                _connectionState.value = ConnectionState.Error(errorMsg)
-            }
-        }
-
-        // Android 13+ (API 33+) callback for characteristic changes
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            handleIncomingBytes(value)
-        }
-
-        // Android 12 and below callback
-        @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            @Suppress("DEPRECATION")
-            val value = characteristic.value ?: return
-            handleIncomingBytes(value)
-        }
-    }
-
-    private fun handleIncomingBytes(bytes: ByteArray) {
-        val text = String(bytes, Charsets.UTF_8)
-        synchronized(rxBuffer) {
-            rxBuffer.append(text)
-            var newlineIndex = rxBuffer.indexOf('\n')
-            while (newlineIndex != -1) {
-                val line = rxBuffer.substring(0, newlineIndex).trim()
-                rxBuffer.delete(0, newlineIndex + 1)
-                if (line.isNotEmpty()) {
-                    processIncomingPacket(line)
+            } catch (e: IOException) {
+                Log.i(TAG, "Socket fermé ou déconnecté: ${e.message}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Erreur dans la boucle de lecture", e)
+            } finally {
+                if (_connectionState.value is ConnectionState.Connected) {
+                    _connectionState.value = ConnectionState.Disconnected
+                    addLog("Connexion Bluetooth fermée", isIncoming = false)
                 }
-                newlineIndex = rxBuffer.indexOf('\n')
             }
         }
     }
 
     /**
      * Parses incoming Bluetooth key-value string lines and updates [BikeState].
+     * Key formats:
+     * - `speed:value` -> update speed display
+     * - `distance:value` -> update distance display
+     * - `lock:true` / `lock:false` -> sync lock state
+     * - `break:true` / `break:false` -> sync brake light status
+     * - `light:true` / `light:false` -> sync light state visual
+     * - `lastalarme:value` -> update Last Alarm display
+     * - `siren:true` / `siren:false` -> sync siren state
+     * - `color:HEX` -> sync color hex
+     * - `brightness:VAL` -> sync brightness
      */
     fun processIncomingPacket(packet: String) {
         addLog(packet, isIncoming = true)
@@ -390,52 +446,25 @@ class BluetoothManager(private val context: Context) {
     }
 
     /**
-     * Sends a raw string command over BLE GATT, ensuring it ends with newline `\n`.
+     * Sends a raw string command over Bluetooth SPP, ensuring it ends with newline `\n`.
      */
     suspend fun sendCommand(command: String): Boolean = withContext(Dispatchers.IO) {
-        val gatt = bluetoothGatt
-        val char = targetCharacteristic
-
-        if (_connectionState.value !is ConnectionState.Connected || gatt == null || char == null) {
-            addLog("Échec de l'envoi '$command': non connecté en BLE", isIncoming = false)
+        val out = outputStream
+        if (_connectionState.value !is ConnectionState.Connected || out == null) {
+            addLog("Échec de l'envoi '$command': non connecté", isIncoming = false)
             return@withContext false
         }
 
         try {
             val formatted = if (command.endsWith("\n")) command else "$command\n"
-            val payload = formatted.toByteArray(Charsets.UTF_8)
-
-            val writeType = if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            }
-
-            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(char, payload, writeType) == BluetoothStatusCodes.SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                char.value = payload
-                @Suppress("DEPRECATION")
-                char.writeType = writeType
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(char)
-            }
-
-            if (success) {
-                addLog(command.trim(), isIncoming = false)
-                true
-            } else {
-                addLog("Échec writeCharacteristic pour '$command'", isIncoming = false)
-                false
-            }
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Erreur permission lors de l'envoi de la commande '$command'", e)
-            addLog("Erreur permission envoi: ${e.localizedMessage}", isIncoming = false)
-            false
-        } catch (e: Exception) {
+            out.write(formatted.toByteArray(Charsets.UTF_8))
+            out.flush()
+            addLog(command.trim(), isIncoming = false)
+            true
+        } catch (e: IOException) {
             Log.e(TAG, "Erreur lors de l'envoi de la commande '$command'", e)
-            addLog("Erreur envoi BLE: ${e.localizedMessage}", isIncoming = false)
+            addLog("Erreur envoi: ${e.localizedMessage}", isIncoming = false)
+            disconnectInternal()
             false
         }
     }
@@ -460,26 +489,30 @@ class BluetoothManager(private val context: Context) {
     suspend fun sendSignalRight(): Boolean = sendCommand("CMD:SIGNAL_RIGHT")
 
     /**
-     * Disconnects the current Bluetooth GATT connection.
+     * Disconnects the current Bluetooth socket and resets status.
      */
     suspend fun disconnect() = withContext(Dispatchers.IO) {
         disconnectInternal()
     }
 
     private fun disconnectInternal() {
+        readJob?.cancel()
+        readJob = null
+
         try {
-            bluetoothGatt?.disconnect()
-            bluetoothGatt?.close()
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Erreur fermeture BluetoothGatt: permission", e)
+            outputStream?.close()
         } catch (e: Exception) {
-            Log.w(TAG, "Erreur fermeture BluetoothGatt", e)
+            Log.w(TAG, "Erreur fermeture outputStream", e)
         } finally {
-            bluetoothGatt = null
-            targetCharacteristic = null
-            synchronized(rxBuffer) {
-                rxBuffer.clear()
-            }
+            outputStream = null
+        }
+
+        try {
+            socket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Erreur fermeture socket", e)
+        } finally {
+            socket = null
         }
 
         _connectionState.value = ConnectionState.Disconnected
